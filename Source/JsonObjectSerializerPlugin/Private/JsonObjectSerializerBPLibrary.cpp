@@ -169,10 +169,6 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TSe
         {
                 if (P->IsInteger())
                 {
-                        if (P->IsUnsignedInt())
-                        {
-                                return MakeShared<FJsonValueNumber>((double)P->GetUnsignedIntPropertyValue(Data));
-                        }
                         return MakeShared<FJsonValueNumber>((double)P->GetSignedIntPropertyValue(Data));
                 }
                 return MakeShared<FJsonValueNumber>(P->GetFloatingPointPropertyValue(Data));
@@ -281,7 +277,7 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                         continue;
                 }
 
-                const TSharedPtr<FJsonValue> Val = Json->GetField(PropName);
+                const TSharedPtr<FJsonValue> Val = Json->GetField(FStringView(*PropName));
                 if (!Val.IsValid())
                 {
                         continue;
@@ -379,14 +375,7 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                 {
                         if (P->IsInteger())
                         {
-                                if (P->IsUnsignedInt())
-                                {
-                                        P->SetUnsignedIntPropertyValue(Data, (uint64)Val->AsNumber());
-                                }
-                                else
-                                {
-                                        P->SetIntPropertyValue(Data, (int64)Val->AsNumber());
-                                }
+                                P->SetIntPropertyValue(Data, (int64)Val->AsNumber());
                         }
                         else
                         {
