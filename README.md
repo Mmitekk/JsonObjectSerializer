@@ -1,6 +1,30 @@
 # JsonObjectSerializer
 
-Плагин для **Unreal Engine 5**, предоставляющий Blueprint-ноды для глубокой сериализации `UObject` в JSON-строку и десериализации обратно. Использует **C++ Reflection** для перебора всех `UPROPERTY`-полей, включая рекурсивную обработку вложенных `UObject*` и `TArray`.
+Плагин для **Unreal Engine 5.8**, предоставляющий Blueprint-ноды для глубокой сериализации `UObject` в JSON-строку и десериализации обратно. Использует **C++ Reflection** для перебора всех `UPROPERTY`-полей, включая рекурсивную обработку вложенных `UObject*` и `TArray`.
+
+---
+
+## Blueprint-ноды
+
+### Make Json From Object
+
+> Serializes a UObject to a JSON string using C++ Reflection.
+>
+> Сериализует UObject в JSON-строку через C++ Reflection. Рекурсивно обрабатывает вложенные UObject* и TArray. В JSON добавляется поле __ObjectClassPath для восстановления класса при десериализации.
+
+**Пины:**
+- **Вход:** `Target` (UObject*) — объект для сериализации
+- **Выход:** `JsonString` (FString) — результат в формате JSON, `Success` (bool) — успешность операции
+
+### Spawn Object From Json
+
+> Deserializes a JSON string into a new UObject created via NewObject.
+>
+> Десериализует JSON-строку в новый UObject, созданный через NewObject. Класс определяется по полю __ObjectClassPath. Рекурсивно обрабатывает вложенные UObject* и TArray. Outer используется как владелец для иерархии объектов.
+
+**Пины:**
+- **Вход:** `Outer` (UObject*) — владелец для иерархии объектов, `InJsonString` (FString) — JSON-строка для десериализации
+- **Выход:** `SpawnedObject` (UObject*) — созданный объект, `Success` (bool) — успешность операции
 
 ---
 
@@ -21,9 +45,9 @@
 ### Десериализация — `Spawn Object From Json`
 
 1. Парсит JSON-строку через `TJsonReader` / `FJsonSerializer`.
-2. Извлекает `__ObjectClassPath`, загружает класс через `LoadClass<UObject>`.
+2. Итерирует `FJsonObject::Values` для извлечения `__ObjectClassPath`, загружает класс через `LoadClass<UObject>`.
 3. Создаёт экземпляр через `NewObject<UObject>(Outer, LoadedClass)`.
-4. Перебирает свойства созданного объекта, ищет совпадающие ключи в JSON и устанавливает значения через Reflection.
+4. Строит карту свойств класса (`TMap<FName, FProperty*>`) и итерирует JSON-значения, мэтча ключи со свойствами по имени.
 5. При обнаружении `UObject*`-свойства с вложенным JSON-объектом — **рекурсивно** вызывает создание вложенного объекта, передавая текущий объект как `Outer`.
 6. При обнаружении `TArray` — очищает массив и заполняет его элементами из JSON-массива через `FScriptArrayHelper`.
 
@@ -142,9 +166,9 @@ public:
 | `int32`          | `FIntProperty`       | Number             |
 | `int64`          | `FInt64Property`     | Number             |
 | `uint8`          | `FByteProperty`      | Number             |
-| `uint16`         | `FUInt16Property`    | Number             |
-| `uint32`         | `FUInt32Property`    | Number             |
-| `uint64`         | `FUInt64Property`    | Number*            |
+| `uint16`         | `FNumericProperty`   | Number             |
+| `uint32`         | `FNumericProperty`   | Number             |
+| `uint64`         | `FNumericProperty`   | Number*            |
 | `float`          | `FFloatProperty`     | Number             |
 | `double`         | `FDoubleProperty`    | Number             |
 | `FString`        | `FStrProperty`       | String             |
@@ -155,7 +179,7 @@ public:
 | `UObject*`       | `FObjectProperty`    | Object (рекурсивно)|
 | `TArray<T>`      | `FArrayProperty`     | Array (рекурсивно) |
 
-> \* `uint64` сериализуется как `double` в JSON. Для значений больше 2^53 возможна потеря точности.
+> \* `uint16`, `uint32`, `uint64` обрабатываются через `FNumericProperty` (т.к. `FUInt16Property`, `FUInt32Property`, `FUInt64Property` были удалены в UE 5.4+). Значения сериализуются как знаковое целое через `GetSignedIntPropertyValue()`, что корректно для значений до 2^53 в JSON. Для `uint64` значений больше 2^53 возможна потеря точности.
 >
 > \*\* `FText` сериализуется через `ToString()` и восстанавливается через `FText::FromString()`. Ключ локализации и пространство имён теряются.
 
@@ -163,11 +187,11 @@ public:
 
 ## ОГРАНИЧЕНИЯ: НЕСОХРАНЯЕМЫЕ ТИПЫ ДАННЫХ
 
-Следующие типы данных **НЕ МОГУТ** быть корректно сериализованы и десериализованы данным плагином. При их обнаружении свойство пропускается (с логированием уровня Verbose).
+Следующие типы данных **НЕ МОГУТ** быть корректно сериализованы и десериализованы данным плагином. При их обнаружении свойство пропускается.
 
 ### Указатели на Actors и внешние Components
 
-**Почему:** `AActor` создаётся через `AActor::SpawnActor()`, а не через `NewObject()`. Плагин использует `NewObject` для создания объектов, что невозможно для Actor. Даже если бы сериализация удалась, после перезапуска игры экземпляр Actor с прежним адресом не существует — указатель протухнет. Внешний `UActorComponent`, принадлежащий другому Actor, также недоступен после перезапуска: его生命周期 привязан к Owner-Actor, который может быть ещё не создан.
+**Почему:** `AActor` создаётся через `AActor::SpawnActor()`, а не через `NewObject()`. Плагин использует `NewObject` для создания объектов, что невозможно для Actor. Кроме того, плагин явно отклоняет классы-наследники `AActor` при десериализации. Внешний `UActorComponent`, принадлежащий другому Actor, также недоступен после перезапуска: его жизненный цикл привязан к Owner-Actor, который может быть ещё не создан.
 
 **Решение:** Используйте идентификаторы (ID, Tag, GUID) для ссылки на Actors и Components. Сохраняйте ID как `FString` или `int32`, а при загрузке ищите объект по ID через `UGameplayStatics::GetAllActorsWithTag`, `FindActorByName` или кастомную систему реестра.
 
@@ -205,26 +229,47 @@ public:
 
 ---
 
+## Совместимость с UE 5.8
+
+Плагин адаптирован под изменения API в **Unreal Engine 5.8**:
+
+- **Удалённые типы свойств:** `FUInt16Property`, `FUInt32Property`, `FUInt64Property` были удалены в UE 5.4+. Беззнаковые целые обрабатываются через `FNumericProperty::IsInteger()` + `GetSignedIntPropertyValue()` / `SetIntPropertyValue()`.
+- **Удалённые методы:** `FNumericProperty::IsUnsignedInt()` и `FNumericProperty::SetUnsignedIntPropertyValue()` удалены. Вместо них используется `SetIntPropertyValue()` для всех целочисленных типов (знаковых и беззнаковых — битовое представление совпадает).
+- **Изменённый API FJsonObject:** Методы `GetField()`, `HasField()`, `TryGetStringField()` изменили сигнатуры (переход на `FStringView` и `UE::FSharedString` в качестве ключей `Values`). Десериализация итерирует `FJsonObject::Values` напрямую и строит карту свойств `TMap<FName, FProperty*>` для мэтча, полностью обходя проблемы совместимости.
+- **Удалённый заголовок:** `UObject/NumericProperty.h` больше не существует — `FNumericProperty` определяется в `UObject/UnrealType.h`.
+
+---
+
 ## Установка
 
-1. Скопируйте папку `JsonObjectSerializer` в директорию `Plugins/` вашего проекта:
+1. Клонируйте репозиторий в директорию `Plugins/` вашего проекта:
    ```
-   MyProject/
-   └── Plugins/
-       └── JsonObjectSerializer/
-           ├── JsonObjectSerializer.uplugin
-           ├── Source/
-           │   └── JsonObjectSerializer/
-           │       ├── JsonObjectSerializer.Build.cs
-           │       ├── Public/
-           │       │   └── JsonObjectSerializerBPLibrary.h
-           │       └── Private/
-           │           └── JsonObjectSerializerBPLibrary.cpp
-           └── README.md
+   cd YourProject/Plugins
+   git clone https://github.com/Mmitekk/JsonObjectSerializer.git
    ```
 2. Перегенерируйте файлы проекта: правый клик на `.uproject` → **Generate Visual Studio project files**.
-3. Скомпилируйте проект.
-4. Включите плагин: **Edit → Plugins → Json Object Serializer** (если не включен автоматически).
+3. Удалите папку `Intermediate/` в корне проекта (если существует).
+4. Скомпилируйте проект в Visual Studio: **Build → Build Solution**.
+5. Откройте проект в UE5 — плагин включён автоматически.
+
+### Структура файлов плагина
+
+```
+JsonObjectSerializer/
+├── JsonObjectSerializer.uplugin
+├── README.md
+└── Source/
+    └── JsonObjectSerializerPlugin/
+        ├── JsonObjectSerializerPlugin.Build.cs
+        ├── Public/
+        │   ├── JsonObjectSerializerPlugin.h
+        │   └── JsonObjectSerializerBPLibrary.h
+        └── Private/
+            ├── JsonObjectSerializerPlugin.cpp
+            └── JsonObjectSerializerBPLibrary.cpp
+```
+
+> **Примечание:** Модуль плагина называется `JsonObjectSerializerPlugin` (не `JsonObjectSerializer`), чтобы избежать коллизии имён с классом Build.cs проекта.
 
 ---
 
@@ -232,6 +277,7 @@ public:
 
 | Параметр                      | Значение                                    |
 |-------------------------------|---------------------------------------------|
+| Целевая версия UE             | 5.8                                         |
 | Тип модуля                    | Runtime                                     |
 | Зависимости                   | `Json`, `JsonUtilities`, `CoreUObject`      |
 | Максимальная глубина рекурсии | 32                                          |
@@ -239,17 +285,4 @@ public:
 | Формат JSON                   | Compact (без пробелов, минимальный размер)  |
 | Создание объектов             | `NewObject<UObject>(Outer, LoadedClass)`    |
 | Загрузка классов              | `LoadClass<UObject>(nullptr, ClassPath)`    |
-
-### Логирование
-
-Плагин использует категорию лога `LogJsonObjectSerializer`. Уровни:
-
-- **Log** — старт/остановка модуля.
-- **Verbose** — пропущенные свойства, отдельные элементы массивов.
-- **Warning** — циклические ссылки, null-указатели, несоответствия типов.
-- **Error** — критические ошибки (класс не найден, JSON невалиден, Actor вместо UObject).
-
-Для включения Verbose-лога в консоли:
-```
-Log LogJsonObjectSerializer Verbose
-```
+| Доступ к JSON-полям           | Итерация `FJsonObject::Values` (UE 5.8)    |
