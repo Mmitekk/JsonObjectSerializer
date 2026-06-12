@@ -8,6 +8,7 @@
 #include "UObject/UnrealType.h"
 #include "UObject/TextProperty.h"
 #include "UObject/EnumProperty.h"
+#include "Containers/SharedString.h"
 
 // ============================================================================
 // Constants
@@ -234,13 +235,26 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 return false;
         }
 
-        // UE 5.8: GetField takes FStringView (not FString)
-        const TSharedPtr<FJsonValue> ClassPathVal = Json->GetField(FStringView(TEXT("__ObjectClassPath")));
-        if (!ClassPathVal.IsValid() || ClassPathVal->Type != EJson::String)
+        // UE 5.8: FJsonObject::Values uses UE::FSharedString keys.
+        // Iterate the map directly to avoid GetField()/HasField() API breakage.
+        FString ClassPath;
+        for (const auto& Pair : Json->Values)
+        {
+                if (Pair.Value.IsValid() && Pair.Value->Type == EJson::String)
+                {
+                        FString KeyStr(Pair.Key);
+                        if (KeyStr == TEXT("__ObjectClassPath"))
+                        {
+                                ClassPath = Pair.Value->AsString();
+                                break;
+                        }
+                }
+        }
+
+        if (ClassPath.IsEmpty())
         {
                 return false;
         }
-        FString ClassPath = ClassPathVal->AsString();
 
         UClass* Cls = LoadClass<UObject>(nullptr, *ClassPath);
         if (!Cls)
@@ -259,30 +273,40 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 return false;
         }
 
+        // Build a property lookup map from the class
+        TMap<FName, FProperty*> PropMap;
         for (TFieldIterator<FProperty> It(OutObj->GetClass()); It; ++It)
         {
                 FProperty* Prop = *It;
-                if (Prop->HasAnyPropertyFlags(CPF_Transient))
+                if (!Prop->HasAnyPropertyFlags(CPF_Transient))
+                {
+                        PropMap.Add(Prop->GetFName(), Prop);
+                }
+        }
+
+        // Iterate JSON Values and match to class properties by name
+        for (const auto& Pair : Json->Values)
+        {
+                FString KeyStr(Pair.Key);
+                if (KeyStr == TEXT("__ObjectClassPath"))
                 {
                         continue;
                 }
 
-                FString PropName = Prop->GetName();
-
-                // UE 5.8: GetField takes FStringView (not FString)
-                const TSharedPtr<FJsonValue> PropVal = Json->GetField(FStringView(*PropName));
-                if (!PropVal.IsValid())
+                FProperty** PropPtr = PropMap.Find(FName(*KeyStr));
+                if (!PropPtr || !Pair.Value.IsValid())
                 {
                         continue;
                 }
 
+                FProperty* Prop = *PropPtr;
                 void* Data = Prop->ContainerPtrToValuePtr<void>(OutObj);
                 if (!Data)
                 {
                         continue;
                 }
 
-                DeserializeProperty(Prop, Data, PropVal, OutObj, Depth + 1);
+                DeserializeProperty(Prop, Data, Pair.Value, OutObj, Depth + 1);
         }
 
         return true;
