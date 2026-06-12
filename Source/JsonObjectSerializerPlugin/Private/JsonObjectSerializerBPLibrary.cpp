@@ -234,11 +234,13 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 return false;
         }
 
-        FString ClassPath;
-        if (!Json->TryGetStringField(TEXT("__ObjectClassPath"), ClassPath))
+        // Direct Values map lookup — bypasses TryGetStringField() API changes in UE 5.8
+        const TSharedPtr<FJsonValue>* ClassPathPtr = Json->Values.Find(TEXT("__ObjectClassPath"));
+        if (!ClassPathPtr || !ClassPathPtr->IsValid() || (*ClassPathPtr)->Type != EJson::String)
         {
                 return false;
         }
+        FString ClassPath = (*ClassPathPtr)->AsString();
 
         UClass* Cls = LoadClass<UObject>(nullptr, *ClassPath);
         if (!Cls)
@@ -266,7 +268,10 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 }
 
                 FString PropName = Prop->GetName();
-                if (!Json->HasField(PropName))
+
+                // Direct Values map lookup — bypasses GetField()/HasField() API changes in UE 5.8
+                const TSharedPtr<FJsonValue>* ValPtr = Json->Values.Find(PropName);
+                if (!ValPtr || !ValPtr->IsValid())
                 {
                         continue;
                 }
@@ -277,13 +282,7 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                         continue;
                 }
 
-                const TSharedPtr<FJsonValue> Val = Json->GetField(FStringView(*PropName));
-                if (!Val.IsValid())
-                {
-                        continue;
-                }
-
-                DeserializeProperty(Prop, Data, Val, OutObj, Depth + 1);
+                DeserializeProperty(Prop, Data, *ValPtr, OutObj, Depth + 1);
         }
 
         return true;
