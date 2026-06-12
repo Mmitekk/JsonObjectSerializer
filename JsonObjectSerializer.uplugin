@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "2.0.0",
+	"FriendlyName": "Json Object Serializer",
+	"Description": "Blueprint nodes for deep UObject serialization to/from JSON using C++ Reflection. Supports recursive serialization of nested UObject pointers and TArray containers.",
+	"Category": "Serialization",
+	"CreatedBy": "JsonObjectSerializer",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "JsonObjectSerializerPlugin",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
