@@ -16,6 +16,8 @@
 
 static constexpr int32 MAX_DEPTH = 32;
 
+DEFINE_LOG_CATEGORY_STATIC(LogJsonObjSer, Warning, All);
+
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -67,6 +69,7 @@ void UJsonObjectSerializerBPLibrary::SpawnObjectFromJson(UObject* Outer, const F
 
         if (!FJsonSerializer::Deserialize(Reader, JsonObj) || !JsonObj.IsValid())
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("Failed to parse JSON string"));
                 return;
         }
 
@@ -76,6 +79,9 @@ void UJsonObjectSerializerBPLibrary::SpawnObjectFromJson(UObject* Outer, const F
         }
 
         Success = DeserializeObject(JsonObj, Outer, SpawnedObject, 0);
+        UE_LOG(LogJsonObjSer, Log, TEXT("SpawnObjectFromJson result: Success=%s, SpawnedObject=%s"),
+                Success ? TEXT("true") : TEXT("false"),
+                SpawnedObject ? *SpawnedObject->GetName() : TEXT("nullptr"));
 }
 
 // ============================================================================
@@ -232,6 +238,7 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
 
         if (!Json.IsValid() || Depth > MAX_DEPTH)
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObject: Invalid JSON or max depth reached (depth=%d)"), Depth);
                 return false;
         }
 
@@ -253,25 +260,35 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
 
         if (ClassPath.IsEmpty())
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObject: __ObjectClassPath not found in JSON"));
                 return false;
         }
+
+        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Loading class '%s' (depth=%d, outer=%s)"),
+                *ClassPath, Depth, Outer ? *Outer->GetName() : TEXT("nullptr"));
 
         UClass* Cls = LoadClass<UObject>(nullptr, *ClassPath);
         if (!Cls)
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObject: LoadClass FAILED for '%s'"), *ClassPath);
                 return false;
         }
 
         if (Cls->IsChildOf(AActor::StaticClass()))
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObject: Class '%s' is an Actor, skipping"), *ClassPath);
                 return false;
         }
 
         OutObj = NewObject<UObject>(Outer, Cls);
         if (!OutObj)
         {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObject: NewObject FAILED for class '%s'"), *ClassPath);
                 return false;
         }
+
+        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Created object '%s' of class '%s'"),
+                *OutObj->GetName(), *Cls->GetName());
 
         // Build a property lookup map from the class
         TMap<FName, FProperty*> PropMap;
@@ -284,6 +301,9 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 }
         }
 
+        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Class '%s' has %d properties in PropMap"),
+                *Cls->GetName(), PropMap.Num());
+
         // Iterate JSON Values and match to class properties by name
         for (const auto& Pair : Json->Values)
         {
@@ -294,7 +314,13 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 }
 
                 FProperty** PropPtr = PropMap.Find(FName(*KeyStr));
-                if (!PropPtr || !Pair.Value.IsValid())
+                if (!PropPtr)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeObject: JSON key '%s' not found in properties of '%s'"),
+                                *KeyStr, *Cls->GetName());
+                        continue;
+                }
+                if (!Pair.Value.IsValid())
                 {
                         continue;
                 }
@@ -306,7 +332,12 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                         continue;
                 }
 
-                DeserializeProperty(Prop, Data, Pair.Value, OutObj, Depth + 1);
+                bool Result = DeserializeProperty(Prop, Data, Pair.Value, OutObj, Depth + 1);
+                if (!Result)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeObject: Failed to set property '%s' (type=%s) on '%s'"),
+                                *KeyStr, *Prop->GetClass()->GetName(), *OutObj->GetName());
+                }
         }
 
         return true;
@@ -458,8 +489,12 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                         if (DeserializeObject(SubJson, Owner, SubObj, Depth))
                         {
                                 P->SetPropertyValue(Data, SubObj);
+                                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: Set UObject* '%s' on property '%s'"),
+                                        SubObj ? *SubObj->GetName() : TEXT("nullptr"), *Prop->GetName());
                                 return true;
                         }
+                        UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeProperty: Failed to deserialize UObject* for property '%s'"),
+                                *Prop->GetName());
                         P->SetPropertyValue(Data, nullptr);
                         return false;
                 }
@@ -475,17 +510,26 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                 const TArray<TSharedPtr<FJsonValue>>& Items = Val->AsArray();
                 FScriptArrayHelper Arr(P, Data);
                 Arr.Resize(0);
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' has %d elements, Inner=%s"),
+                        *Prop->GetName(), Items.Num(), *P->Inner->GetClass()->GetName());
                 for (int32 i = 0; i < Items.Num(); ++i)
                 {
                         int32 Idx = Arr.AddValue();
                         void* Elem = Arr.GetRawPtr(Idx);
                         if (Elem)
                         {
-                                DeserializeProperty(P->Inner, Elem, Items[i], Owner, Depth);
+                                bool Result = DeserializeProperty(P->Inner, Elem, Items[i], Owner, Depth);
+                                if (!Result)
+                                {
+                                        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeProperty: Failed to deserialize array element [%d] of '%s'"),
+                                                i, *Prop->GetName());
+                                }
                         }
                 }
                 return true;
         }
 
+        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeProperty: Unsupported property type '%s' for property '%s'"),
+                *Prop->GetClass()->GetName(), *Prop->GetName());
         return false;
 }
