@@ -203,6 +203,15 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TSe
                 {
                         return MakeShared<FJsonValueNull>();
                 }
+                // If already visited (duplicate reference in another array/property),
+                // create a stub with just the class path so deserialization can
+                // spawn a new instance instead of leaving a null in the array.
+                if (Visited.Contains(SubObj))
+                {
+                        TSharedPtr<FJsonObject> StubJson = MakeShared<FJsonObject>();
+                        StubJson->SetStringField(TEXT("__ObjectClassPath"), SubObj->GetClass()->GetPathName());
+                        return MakeShared<FJsonValueObject>(StubJson);
+                }
                 TSharedPtr<FJsonObject> SubJson = SerializeObject(SubObj, Visited, Depth);
                 if (SubJson.IsValid())
                 {
