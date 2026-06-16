@@ -8,6 +8,8 @@
 #include "UObject/UnrealType.h"
 #include "UObject/TextProperty.h"
 #include "UObject/EnumProperty.h"
+#include "UObject/Object.h"
+#include "HAL/Platform.h"
 #include "Containers/SharedString.h"
 
 // ============================================================================
@@ -26,6 +28,16 @@ static TSharedPtr<FJsonObject> SerializeObject(UObject* Object, TSet<const UObje
 static TSharedPtr<FJsonValue>  SerializeProperty(FProperty* Prop, void* Data, TSet<const UObject*>& Visited, int32 Depth);
 static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Outer, UObject*& OutObj, int32 Depth);
 static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJsonValue>& Val, UObject* Owner, int32 Depth);
+
+// ============================================================================
+// Helper: convert FJsonObject Values key (UE::FSharedString in 5.8) to FString
+// ============================================================================
+
+static FORCEINLINE FString FSharedStringToFString(const UE::FSharedString& SharedStr)
+{
+        // UE::FSharedString has operator FStringView() which FString can construct from.
+        return FString(FStringView(SharedStr));
+}
 
 // ============================================================================
 // Public API
@@ -242,14 +254,14 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 return false;
         }
 
-        // UE 5.8: FJsonObject::Values uses UE::FSharedString keys.
+        // UE 5.8+: FJsonObject::Values uses UE::FSharedString keys.
         // Iterate the map directly to avoid GetField()/HasField() API breakage.
         FString ClassPath;
         for (const auto& Pair : Json->Values)
         {
                 if (Pair.Value.IsValid() && Pair.Value->Type == EJson::String)
                 {
-                        FString KeyStr(Pair.Key);
+                        FString KeyStr = FSharedStringToFString(Pair.Key);
                         if (KeyStr == TEXT("__ObjectClassPath"))
                         {
                                 ClassPath = Pair.Value->AsString();
@@ -304,10 +316,21 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
         UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Class '%s' has %d properties in PropMap"),
                 *Cls->GetName(), PropMap.Num());
 
+        // Log all property names for debugging
+        {
+                FString PropNames;
+                for (const auto& PropPair : PropMap)
+                {
+                        if (!PropNames.IsEmpty()) PropNames += TEXT(", ");
+                        PropNames += PropPair.Key.ToString() + TEXT("(") + PropPair.Value->GetClass()->GetName() + TEXT(")");
+                }
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Properties: [%s]"), *PropNames);
+        }
+
         // Iterate JSON Values and match to class properties by name
         for (const auto& Pair : Json->Values)
         {
-                FString KeyStr(Pair.Key);
+                FString KeyStr = FSharedStringToFString(Pair.Key);
                 if (KeyStr == TEXT("__ObjectClassPath"))
                 {
                         continue;
@@ -331,6 +354,9 @@ static bool DeserializeObject(const TSharedPtr<FJsonObject>& Json, UObject* Oute
                 {
                         continue;
                 }
+
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeObject: Setting property '%s' (type=%s) on '%s'"),
+                        *KeyStr, *Prop->GetClass()->GetName(), *OutObj->GetName());
 
                 bool Result = DeserializeProperty(Prop, Data, Pair.Value, OutObj, Depth + 1);
                 if (!Result)
@@ -488,14 +514,16 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                         UObject* SubObj = nullptr;
                         if (DeserializeObject(SubJson, Owner, SubObj, Depth))
                         {
-                                P->SetPropertyValue(Data, SubObj);
+                                // Write the pointer directly to avoid any Offset_Internal issues
+                                // with SetPropertyValue on inner properties of arrays
+                                *(UObject**)Data = SubObj;
                                 UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: Set UObject* '%s' on property '%s'"),
                                         SubObj ? *SubObj->GetName() : TEXT("nullptr"), *Prop->GetName());
                                 return true;
                         }
                         UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeProperty: Failed to deserialize UObject* for property '%s'"),
                                 *Prop->GetName());
-                        P->SetPropertyValue(Data, nullptr);
+                        *(UObject**)Data = nullptr;
                         return false;
                 }
                 return false;
@@ -505,20 +533,77 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
         {
                 if (Type != EJson::Array)
                 {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeProperty: TArray '%s' expected Array but got %d"),
+                                *Prop->GetName(), (int32)Type);
                         return false;
                 }
                 const TArray<TSharedPtr<FJsonValue>>& Items = Val->AsArray();
                 FScriptArrayHelper Arr(P, Data);
+
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' has %d JSON elements, Inner=%s, InnerSize=%d"),
+                        *Prop->GetName(), Items.Num(), *P->Inner->GetClass()->GetName(), P->Inner->ElementSize);
+
+                // Clear and pre-allocate all elements at once
                 Arr.Resize(0);
-                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' has %d elements, Inner=%s"),
-                        *Prop->GetName(), Items.Num(), *P->Inner->GetClass()->GetName());
+                Arr.Resize(Items.Num());
+
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' resized to %d elements"),
+                        *Prop->GetName(), Arr.Num());
+
                 for (int32 i = 0; i < Items.Num(); ++i)
                 {
-                        int32 Idx = Arr.AddValue();
-                        void* Elem = Arr.GetRawPtr(Idx);
-                        if (Elem)
+                        void* Elem = Arr.GetRawPtr(i);
+                        if (!Elem)
                         {
-                                bool Result = DeserializeProperty(P->Inner, Elem, Items[i], Owner, Depth);
+                                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeProperty: TArray '%s' element [%d] GetRawPtr returned null!"),
+                                        *Prop->GetName(), i);
+                                continue;
+                        }
+
+                        // Explicitly zero the element memory before deserialization
+                        FMemory::Memzero(Elem, P->Inner->ElementSize);
+
+                        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' element [%d] type=%d, inner=%s"),
+                                *Prop->GetName(), i, (int32)(Items[i].IsValid() ? Items[i]->Type : EJson::Null), *P->Inner->GetClass()->GetName());
+
+                        // Special handling for TArray<UObject*> — write pointer directly
+                        if (FObjectProperty* InnerObjProp = CastField<FObjectProperty>(P->Inner))
+                        {
+                                if (!Items[i].IsValid() || Items[i]->Type == EJson::Null)
+                                {
+                                        // Already zeroed by Memzero above
+                                        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' element [%d] is null"), *Prop->GetName(), i);
+                                }
+                                else if (Items[i]->Type == EJson::Object)
+                                {
+                                        const TSharedPtr<FJsonObject> SubJson = Items[i]->AsObject();
+                                        if (SubJson.IsValid())
+                                        {
+                                                UObject* SubObj = nullptr;
+                                                if (DeserializeObject(SubJson, Owner, SubObj, Depth + 1))
+                                                {
+                                                        // Write the pointer directly into the array element
+                                                        *(UObject**)Elem = SubObj;
+                                                        UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' element [%d] set to object '%s'"),
+                                                                *Prop->GetName(), i, *SubObj->GetName());
+                                                }
+                                                else
+                                                {
+                                                        UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeProperty: TArray '%s' element [%d] failed to deserialize sub-object"),
+                                                                *Prop->GetName(), i);
+                                                }
+                                        }
+                                }
+                                else
+                                {
+                                        UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeProperty: TArray '%s' element [%d] unexpected type %d for UObject*"),
+                                                *Prop->GetName(), i, (int32)Items[i]->Type);
+                                }
+                        }
+                        else
+                        {
+                                // For non-UObject* array elements (int, float, string, etc.), use generic deserialization
+                                bool Result = DeserializeProperty(P->Inner, Elem, Items[i], Owner, Depth + 1);
                                 if (!Result)
                                 {
                                         UE_LOG(LogJsonObjSer, Warning, TEXT("DeserializeProperty: Failed to deserialize array element [%d] of '%s'"),
@@ -526,6 +611,11 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                                 }
                         }
                 }
+
+                // Verify the array was populated
+                UE_LOG(LogJsonObjSer, Log, TEXT("DeserializeProperty: TArray '%s' final count=%d"),
+                        *Prop->GetName(), Arr.Num());
+
                 return true;
         }
 
