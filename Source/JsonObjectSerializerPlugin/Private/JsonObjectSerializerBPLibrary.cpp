@@ -787,7 +787,10 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
 
                         // Re-initialize the slot through the property (handles FString, nested
                         // arrays, etc. correctly). For UObject* this is equivalent to zeroing.
-                        P->Inner->InitializeValueInContainer(Elem);
+                        // Note: Elem already points directly at the element, so we use
+                        // InitializeValue (NOT InitializeValueInContainer, which expects a
+                        // container and is not part of FProperty's public API in UE 5.8).
+                        P->Inner->InitializeValue(Elem);
 
                         const TSharedPtr<FJsonValue>& ItemVal = Items[i];
 
@@ -796,7 +799,7 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                         {
                                 if (!ItemVal.IsValid() || ItemVal->Type == EJson::Null)
                                 {
-                                        // Slot already initialized to nullptr by InitializeValueInContainer
+                                        // Slot already initialized to nullptr by InitializeValue
                                         continue;
                                 }
                                 if (ItemVal->Type == EJson::Object)
