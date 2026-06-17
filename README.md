@@ -2,6 +2,8 @@
 
 A **Unreal Engine 5.8** plugin providing Blueprint nodes for deep serialization of `UObject` to JSON string and back. Uses **C++ Reflection** to iterate all `UPROPERTY` fields, including recursive handling of nested `UObject*` and `TArray`.
 
+> **v3.0.0** — Fixed the long-standing bug where arrays containing cyclic or shared `UObject*` references (e.g. a parent quest collection pointing at a child objective, which in turn points back at the parent) came back **empty** after `Spawn Object From Json`. The serializer now assigns each object a stable `__ObjectId` and emits compact `{"__ObjectRef": N}` stubs for repeat encounters; the deserializer runs in two passes (create-all → fill-all) so cycles resolve correctly. See [How It Works](#how-it-works) for details.
+
 ---
 
 ## Blueprint Nodes
@@ -100,19 +102,39 @@ The plugin solves the problem of saving nested `UObject` data (e.g., stat object
 1. Iterates all `UPROPERTY` fields of the object (except those marked `Transient`).
 2. Determines the type of each field via C++ Reflection (`CastField<FBoolProperty>`, `CastField<FIntProperty>`, etc.).
 3. Writes the variable name and its value to the JSON object.
-4. When a `UObject*` is found — **recursively** serializes it as a nested JSON object (with its own `__ObjectClassPath`).
+4. When a `UObject*` is found — **recursively** serializes it as a nested JSON object (with its own `__ObjectClassPath` and `__ObjectId`).
 5. When a `TArray` is found — serializes it as a JSON array, recursively processing each element.
-6. Adds a hidden field `__ObjectClassPath` to the root of the JSON object with the value `GetClass()->GetPathName()` — the class path for subsequent reconstruction.
-7. Protection against infinite recursion: `TSet<const UObject*>` for cycle detection and a depth limit of 32 levels.
+6. Adds hidden fields to the root of the JSON object:
+   - `__ObjectClassPath` = `GetClass()->GetPathName()` — the class path for subsequent reconstruction.
+   - `__ObjectId` = unique integer ID assigned to this object (for cyclic / shared reference tracking).
+7. **Cyclic & shared reference handling**: a `TMap<const UObject*, int32>` tracks every object that has already been serialized. The first time an object is encountered, it is serialized fully and tagged with `__ObjectId`. On every subsequent encounter (cycle, or the same object referenced from multiple places), a compact stub is emitted instead:
+   ```json
+   { "__ObjectRef": 5 }
+   ```
+   This preserves array structure (no null holes) and restores the shared reference on load. The previous behavior of writing `null` for repeated references caused "empty" arrays after deserialization — this is now fixed.
+8. Protection against infinite recursion: depth limit of 64 levels.
 
 ### Deserialization — `Spawn Object From Json`
 
-1. Parses the JSON string via `TJsonReader` / `FJsonSerializer`.
-2. Iterates `FJsonObject::Values` to extract `__ObjectClassPath`, loads the class via `LoadClass<UObject>`.
-3. Creates an instance via `NewObject<UObject>(Outer, LoadedClass)`.
-4. Builds a property map (`TMap<FName, FProperty*>`) and iterates JSON values, matching keys to properties by name.
-5. When a `UObject*` property with a nested JSON object is found — **recursively** creates the nested object, passing the current object as `Outer`.
-6. When a `TArray` is found — clears the array and fills it with elements from the JSON array via `FScriptArrayHelper`.
+Two-pass algorithm so cyclic and shared references can be resolved correctly.
+
+**Pass 1 — create all objects:**
+1. Recursively walks the JSON tree.
+2. For every JSON object with a `__ObjectClassPath` field (and NOT a `__ObjectRef` stub), loads the class via `LoadClass<UObject>` and creates a blank instance via `NewObject<UObject>(Outer, LoadedClass)`.
+3. Registers the instance in `IdMap` keyed by its `__ObjectId`, so any later `__ObjectRef` can find it.
+4. Properties are NOT filled yet — this is essential so that a reference to a not-yet-created object can be resolved later.
+
+**Pass 2 — fill properties & resolve references:**
+1. Walks the JSON tree again, starting from the root.
+2. For each property, sets primitive values directly via reflection (`SetPropertyValue`, `SetIntPropertyValue`, etc.).
+3. For `UObject*` properties:
+   - If the JSON value is `null` → sets the pointer to `nullptr`.
+   - If the JSON value has `__ObjectRef` → looks up the already-created `UObject*` in `IdMap` and assigns it.
+   - If the JSON value has `__ObjectId` → looks up the already-created `UObject*` in `IdMap`, assigns it, and recurses into Pass 2 to fill that object's properties.
+   - Legacy fallback: if neither `__ObjectRef` nor `__ObjectId` is present (old JSON without ID tracking), creates a new instance inline.
+4. For `TArray` properties — clears the array via `FScriptArrayHelper`, resizes it to the JSON array length, properly initializes each element through `FProperty::InitializeValueInContainer`, then fills each element using the same rules as above.
+
+> **Result**: arrays that contain cyclic / shared references are now restored with their full structure intact — no `None` holes, no missing entries.
 
 ---
 
