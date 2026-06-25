@@ -275,10 +275,24 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TMa
                 }
                 return MakeShared<FJsonValueNumber>(P->GetFloatingPointPropertyValue(Data));
         }
-        // FString — clamp to 10 MB to prevent crash on corrupted data
+        // FString — if large enough, try to embed pre-serialized JSON as a real JSON
+        // value instead of a double-escaped string (prevents growth like NeedsJsonString).
         if (FStrProperty* P = CastField<FStrProperty>(Prop))
         {
                 const FString& Val = P->GetPropertyValue(Data);
+
+                if (Val.Len() > 4096)
+                {
+                        TSharedPtr<FJsonValue> Parsed;
+                        TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Val);
+                        if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid())
+                        {
+                                TSharedPtr<FJsonObject> Wrapper = MakeShared<FJsonObject>();
+                                Wrapper->SetField(TEXT("__StringJson"), Parsed);
+                                return MakeShared<FJsonValueObject>(Wrapper);
+                        }
+                }
+
                 if (Val.Len() > 10 * 1024 * 1024)
                 {
                         UE_LOG(LogJsonObjSer, Warning, TEXT("SerializeProperty: Truncating FString '%s' (len=%lld) to 10 MB"), *Prop->GetName(), (int64)Val.Len());
@@ -670,6 +684,50 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                 {
                         P->SetPropertyValue(Data, Val->AsString());
                         return true;
+                }
+                if (Type == EJson::Object)
+                {
+                        TSharedPtr<FJsonObject> Obj = Val->AsObject();
+                        if (Obj.IsValid())
+                        {
+                                TSharedPtr<FJsonValue> Inner;
+                                for (const auto& KVP : Obj->Values)
+                                {
+                                        if (KVP.Value.IsValid() && FSharedStringToFString(KVP.Key) == TEXT("__StringJson"))
+                                        {
+                                                Inner = KVP.Value;
+                                                break;
+                                        }
+                                }
+                                if (Inner.IsValid())
+                                {
+                                        FString JsonStr;
+                                        if (Inner->Type == EJson::Object)
+                                        {
+                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
+                                                FJsonSerializer::Serialize(Inner->AsObject().ToSharedRef(), Writer);
+                                        }
+                                        else if (Inner->Type == EJson::Array)
+                                        {
+                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
+                                                FJsonSerializer::Serialize(Inner->AsArray(), Writer);
+                                        }
+                                        else
+                                        {
+                                                TArray<TSharedPtr<FJsonValue>> Wrapper;
+                                                Wrapper.Add(Inner);
+                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
+                                                FJsonSerializer::Serialize(Wrapper, Writer);
+                                                if (JsonStr.Len() >= 2) JsonStr = JsonStr.Mid(1, JsonStr.Len() - 2);
+                                        }
+                                        P->SetPropertyValue(Data, JsonStr);
+                                        return true;
+                                }
+                        }
+                        return false;
                 }
                 return false;
         }
