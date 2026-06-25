@@ -275,20 +275,38 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TMa
                 }
                 return MakeShared<FJsonValueNumber>(P->GetFloatingPointPropertyValue(Data));
         }
-        // FString
+        // FString — clamp to 10 MB to prevent crash on corrupted data
         if (FStrProperty* P = CastField<FStrProperty>(Prop))
         {
-                return MakeShared<FJsonValueString>(P->GetPropertyValue(Data));
+                const FString& Val = P->GetPropertyValue(Data);
+                if (Val.Len() > 10 * 1024 * 1024)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("SerializeProperty: Truncating FString '%s' (len=%lld) to 10 MB"), *Prop->GetName(), (int64)Val.Len());
+                        return MakeShared<FJsonValueString>(Val.Left(10 * 1024 * 1024));
+                }
+                return MakeShared<FJsonValueString>(Val);
         }
         // FName
         if (FNameProperty* P = CastField<FNameProperty>(Prop))
         {
-                return MakeShared<FJsonValueString>(P->GetPropertyValue(Data).ToString());
+                const FString Val = P->GetPropertyValue(Data).ToString();
+                if (Val.Len() > 10 * 1024 * 1024)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("SerializeProperty: Truncating FName '%s' (len=%lld) to 10 MB"), *Prop->GetName(), (int64)Val.Len());
+                        return MakeShared<FJsonValueString>(Val.Left(10 * 1024 * 1024));
+                }
+                return MakeShared<FJsonValueString>(Val);
         }
         // FText
         if (FTextProperty* P = CastField<FTextProperty>(Prop))
         {
-                return MakeShared<FJsonValueString>(P->GetPropertyValue(Data).ToString());
+                const FString Val = P->GetPropertyValue(Data).ToString();
+                if (Val.Len() > 10 * 1024 * 1024)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("SerializeProperty: Truncating FText '%s' (len=%lld) to 10 MB"), *Prop->GetName(), (int64)Val.Len());
+                        return MakeShared<FJsonValueString>(Val.Left(10 * 1024 * 1024));
+                }
+                return MakeShared<FJsonValueString>(Val);
         }
         // UObject* - recursive
         if (FObjectProperty* P = CastField<FObjectProperty>(Prop))
@@ -307,12 +325,18 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TMa
                 }
                 return MakeShared<FJsonValueNull>();
         }
-        // TArray - recursive
+        // TArray — clamp to 1M elements to prevent crash on corrupted data
         if (FArrayProperty* P = CastField<FArrayProperty>(Prop))
         {
                 FScriptArrayHelper Arr(P, Data);
+                int32 Num = Arr.Num();
+                if (Num > 1000000)
+                {
+                        UE_LOG(LogJsonObjSer, Warning, TEXT("SerializeProperty: Truncating TArray '%s' (num=%d) to 1M elements"), *Prop->GetName(), Num);
+                        Num = 1000000;
+                }
                 TArray<TSharedPtr<FJsonValue>> Items;
-                for (int32 i = 0; i < Arr.Num(); ++i)
+                for (int32 i = 0; i < Num; ++i)
                 {
                         void* Elem = Arr.GetRawPtr(i);
                         TSharedPtr<FJsonValue> Item = SerializeProperty(P->Inner, Elem, Visited, NextIdHolder, Depth);
