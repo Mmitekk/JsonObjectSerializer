@@ -11,6 +11,8 @@
 #include "UObject/Object.h"
 #include "HAL/Platform.h"
 #include "Containers/SharedString.h"
+#include "GameFramework/Actor.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 
 // ============================================================================
 // Constants
@@ -115,10 +117,10 @@ void UJsonObjectSerializerBPLibrary::MakeJsonFromObject(UObject* Target, FString
                 return;
         }
 
-        TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-                TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonString);
+        TSharedRef<TJsonStringWriter<TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+                TJsonStringWriter<TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonString);
 
-        Success = FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+        Success = FJsonSerializer::Serialize(Obj, *Writer, true);
 }
 
 void UJsonObjectSerializerBPLibrary::SpawnObjectFromJson(UObject* Outer, const FString& InJsonString, UObject*& SpawnedObject, bool& Success)
@@ -142,7 +144,7 @@ void UJsonObjectSerializerBPLibrary::SpawnObjectFromJson(UObject* Outer, const F
 
         if (!IsValid(Outer))
         {
-                Outer = GetTransientPackage();
+                Outer = GetTransientPackageAsObject();
         }
 
         TMap<int32, UObject*> IdMap;
@@ -328,6 +330,11 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TMa
         {
                 UObject* SubObj = P->GetPropertyValue(Data);
                 if (!IsValid(SubObj) || SubObj->HasAnyFlags(RF_Transient))
+                {
+                        return MakeShared<FJsonValueNull>();
+                }
+                // Actors cannot be recreated via NewObject — skip them entirely.
+                if (SubObj->IsA(AActor::StaticClass()))
                 {
                         return MakeShared<FJsonValueNull>();
                 }
@@ -703,25 +710,21 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                                 if (Inner.IsValid())
                                 {
                                         FString JsonStr;
+                                        TSharedRef<TJsonStringWriter<TCondensedJsonPrintPolicy<TCHAR>>> StrWriter =
+                                                TJsonStringWriter<TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
                                         if (Inner->Type == EJson::Object)
                                         {
-                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
-                                                FJsonSerializer::Serialize(Inner->AsObject().ToSharedRef(), Writer);
+                                                FJsonSerializer::Serialize(Inner->AsObject(), *StrWriter, true);
                                         }
                                         else if (Inner->Type == EJson::Array)
                                         {
-                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
-                                                FJsonSerializer::Serialize(Inner->AsArray(), Writer);
+                                                FJsonSerializer::Serialize(Inner->AsArray(), *StrWriter, true);
                                         }
                                         else
                                         {
                                                 TArray<TSharedPtr<FJsonValue>> Wrapper;
                                                 Wrapper.Add(Inner);
-                                                TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-                                                        TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&JsonStr);
-                                                FJsonSerializer::Serialize(Wrapper, Writer);
+                                                FJsonSerializer::Serialize(Wrapper, *StrWriter, true);
                                                 if (JsonStr.Len() >= 2) JsonStr = JsonStr.Mid(1, JsonStr.Len() - 2);
                                         }
                                         P->SetPropertyValue(Data, JsonStr);
