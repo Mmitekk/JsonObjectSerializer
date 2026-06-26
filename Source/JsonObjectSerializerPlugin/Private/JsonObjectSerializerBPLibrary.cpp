@@ -277,11 +277,12 @@ static TSharedPtr<FJsonValue> SerializeProperty(FProperty* Prop, void* Data, TMa
         }
         // FString — if large enough, try to embed pre-serialized JSON as a real JSON
         // value instead of a double-escaped string (prevents growth like NeedsJsonString).
+        static constexpr int32 MAX_PARSE_JSON_LEN = 50 * 1024 * 1024; // don't try to parse strings over 50 MB
         if (FStrProperty* P = CastField<FStrProperty>(Prop))
         {
                 const FString& Val = P->GetPropertyValue(Data);
 
-                if (Val.Len() > 4096)
+                if (Val.Len() > 4096 && Val.Len() <= MAX_PARSE_JSON_LEN)
                 {
                         TSharedPtr<FJsonValue> Parsed;
                         TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(Val);
