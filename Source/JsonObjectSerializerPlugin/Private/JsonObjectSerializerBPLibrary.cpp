@@ -197,14 +197,21 @@ static TSharedPtr<FJsonObject> SerializeObject(UObject* Object, TMap<const UObje
         const int32 ThisId = NextIdHolder[0]++;
         Visited.Add(Object, ThisId);
 
+        UClass* ObjClass = Object->GetClass();
+        if (!ObjClass)
+        {
+                UE_LOG(LogJsonObjSer, Error, TEXT("SerializeObject: Object '%s' has null class!"), *Object->GetName());
+                return nullptr;
+        }
+
         TSharedPtr<FJsonObject> JsonObj = MakeShared<FJsonObject>();
-        JsonObj->SetStringField(TEXT("__ObjectClassPath"), Object->GetClass()->GetPathName());
+        JsonObj->SetStringField(TEXT("__ObjectClassPath"), ObjClass->GetPathName());
         JsonObj->SetNumberField(TEXT("__ObjectId"), (double)ThisId);
 
-        for (TFieldIterator<FProperty> It(Object->GetClass()); It; ++It)
+        for (TFieldIterator<FProperty> It(ObjClass); It; ++It)
         {
                 FProperty* Prop = *It;
-                if (Prop->HasAnyPropertyFlags(CPF_Transient))
+                if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient))
                 {
                         continue;
                 }
@@ -490,14 +497,21 @@ static UObject* DeserializeObjectPass1(const TSharedPtr<FJsonObject>& Json, UObj
         }
 
         // Build a property lookup map for this object's class
+        UClass* ObjClass = Obj->GetClass();
+        if (!ObjClass)
+        {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObjectPass1: Object '%s' has null class!"), *Obj->GetName());
+                return nullptr;
+        }
         TMap<FName, FProperty*> PropMap;
-        for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
+        for (TFieldIterator<FProperty> It(ObjClass); It; ++It)
         {
                 FProperty* Prop = *It;
-                if (!Prop->HasAnyPropertyFlags(CPF_Transient))
+                if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient))
                 {
-                        PropMap.Add(Prop->GetFName(), Prop);
+                        continue;
                 }
+                PropMap.Add(Prop->GetFName(), Prop);
         }
 
         // Recurse into properties that may contain nested UObjects
@@ -541,15 +555,23 @@ static bool DeserializeObjectPass2(const TSharedPtr<FJsonObject>& Json, UObject*
                 Filled.Add(ThisId);
         }
 
+        UClass* ObjClass = Obj->GetClass();
+        if (!ObjClass)
+        {
+                UE_LOG(LogJsonObjSer, Error, TEXT("DeserializeObjectPass2: Object '%s' has null class!"), *Obj->GetName());
+                return false;
+        }
+
         // Build a property lookup map
         TMap<FName, FProperty*> PropMap;
-        for (TFieldIterator<FProperty> It(Obj->GetClass()); It; ++It)
+        for (TFieldIterator<FProperty> It(ObjClass); It; ++It)
         {
                 FProperty* Prop = *It;
-                if (!Prop->HasAnyPropertyFlags(CPF_Transient))
+                if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient))
                 {
-                        PropMap.Add(Prop->GetFName(), Prop);
+                        continue;
                 }
+                PropMap.Add(Prop->GetFName(), Prop);
         }
 
         bool bAllOk = true;
@@ -566,7 +588,7 @@ static bool DeserializeObjectPass2(const TSharedPtr<FJsonObject>& Json, UObject*
                 if (!PropPtr)
                 {
                         UE_LOG(LogJsonObjSer, Verbose, TEXT("Pass2: JSON key '%s' not found in properties of '%s'"),
-                                *KeyStr, *Obj->GetClass()->GetName());
+                                *KeyStr, *ObjClass->GetName());
                         continue;
                 }
                 if (!Pair.Value.IsValid())
@@ -778,15 +800,17 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                         if (JsonIsObjectRef(SubJson, RefId))
                         {
                                 UObject** Found = IdMap.Find(RefId);
-                                if (Found)
+                                if (Found && IsValid(*Found))
                                 {
                                         *(UObject**)Data = *Found;
                                         UE_LOG(LogJsonObjSer, Verbose, TEXT("Pass2: Resolved __ObjectRef %d -> '%s'"),
-                                                RefId, *Found ? *(*Found)->GetName() : TEXT("null"));
+                                                RefId, *(*Found)->GetName());
                                         return true;
                                 }
-                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: __ObjectRef %d not found in IdMap (property '%s')"),
-                                        RefId, *Prop->GetName());
+                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: __ObjectRef %d %s (property '%s')"),
+                                        RefId,
+                                        Found ? TEXT("points to invalid object") : TEXT("not found in IdMap"),
+                                        *Prop->GetName());
                                 *(UObject**)Data = nullptr;
                                 return false;
                         }
@@ -797,16 +821,18 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                         if (SubId > 0)
                         {
                                 UObject** Found = IdMap.Find(SubId);
-                                if (Found)
+                                if (Found && IsValid(*Found))
                                 {
                                         UObject* SubObj = *Found;
                                         *(UObject**)Data = SubObj;
                                         // Recurse to fill this sub-object's properties (Pass 2)
-                                        if (SubObj)
-                                        {
-                                                DeserializeObjectPass2(SubJson, SubObj, IdMap, Filled, Depth + 1);
-                                        }
+                                        DeserializeObjectPass2(SubJson, SubObj, IdMap, Filled, Depth + 1);
                                         return true;
+                                }
+                                if (Found)
+                                {
+                                        UE_LOG(LogJsonObjSer, Warning, TEXT("Pass2: __ObjectId %d points to invalid object — removing stale entry"), SubId);
+                                        IdMap.Remove(SubId);
                                 }
                                 // Not in map — Pass 1 failed for this object. Try to create inline as fallback.
                                 UE_LOG(LogJsonObjSer, Warning, TEXT("Pass2: __ObjectId %d missing from IdMap, attempting inline creation"), SubId);
@@ -871,6 +897,15 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                                 continue;
                         }
 
+                        // Guard: Inner property must be valid before we use it
+                        if (!P->Inner)
+                        {
+                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: TArray '%s' has null Inner property!"),
+                                        *Prop->GetName());
+                                bAllOk = false;
+                                continue;
+                        }
+
                         // Re-initialize the slot through the property (handles FString, nested
                         // arrays, etc. correctly). For UObject* this is equivalent to zeroing.
                         // Note: Elem already points directly at the element, so we use
@@ -893,21 +928,23 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                                         const TSharedPtr<FJsonObject> SubJson = ItemVal->AsObject();
                                         if (SubJson.IsValid())
                                         {
-                                                int32 RefId = 0;
+                                                        int32 RefId = 0;
                                                 if (JsonIsObjectRef(SubJson, RefId))
                                                 {
                                                         // Resolve reference
                                                         UObject** Found = IdMap.Find(RefId);
-                                                        if (Found)
+                                                        if (Found && IsValid(*Found))
                                                         {
                                                                 *(UObject**)Elem = *Found;
                                                                 UE_LOG(LogJsonObjSer, Verbose, TEXT("Pass2: TArray '%s'[%d] -> __ObjectRef %d = '%s'"),
-                                                                        *Prop->GetName(), i, RefId, *Found ? *(*Found)->GetName() : TEXT("null"));
+                                                                        *Prop->GetName(), i, RefId, *(*Found)->GetName());
                                                         }
                                                         else
                                                         {
-                                                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: TArray '%s'[%d] __ObjectRef %d not found"),
-                                                                        *Prop->GetName(), i, RefId);
+                                                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: TArray '%s'[%d] __ObjectRef %d %s"),
+                                                                        *Prop->GetName(), i, RefId,
+                                                                        Found ? TEXT("points to invalid object") : TEXT("not found in IdMap"));
+                                                                *(UObject**)Elem = nullptr;
                                                                 bAllOk = false;
                                                         }
                                                         continue;
@@ -918,21 +955,28 @@ static bool DeserializeProperty(FProperty* Prop, void* Data, const TSharedPtr<FJ
                                                 if (SubId > 0)
                                                 {
                                                         UObject** Found = IdMap.Find(SubId);
-                                                        if (Found)
+                                                        if (Found && IsValid(*Found))
                                                         {
                                                                 UObject* SubObj = *Found;
                                                                 *(UObject**)Elem = SubObj;
-                                                                if (SubObj)
-                                                                {
-                                                                        DeserializeObjectPass2(SubJson, SubObj, IdMap, Filled, Depth + 1);
-                                                                }
+                                                                DeserializeObjectPass2(SubJson, SubObj, IdMap, Filled, Depth + 1);
                                                                 UE_LOG(LogJsonObjSer, Verbose, TEXT("Pass2: TArray '%s'[%d] -> __ObjectId %d = '%s'"),
-                                                                        *Prop->GetName(), i, SubId, SubObj ? *SubObj->GetName() : TEXT("null"));
+                                                                        *Prop->GetName(), i, SubId, *SubObj->GetName());
                                                                 continue;
                                                         }
-                                                        // Fallback: inline creation (legacy JSON or Pass 1 missed it)
-                                                        UE_LOG(LogJsonObjSer, Warning, TEXT("Pass2: TArray '%s'[%d] __ObjectId %d missing — inline create"),
-                                                                *Prop->GetName(), i, SubId);
+                                                        if (Found)
+                                                        {
+                                                                UE_LOG(LogJsonObjSer, Error, TEXT("Pass2: TArray '%s'[%d] __ObjectId %d points to invalid object — re-creating"),
+                                                                        *Prop->GetName(), i, SubId);
+                                                                // Remove stale entry, will be recreated inline below
+                                                                IdMap.Remove(SubId);
+                                                        }
+                                                        else
+                                                        {
+                                                                // Fallback: inline creation (Pass 1 missed it)
+                                                                UE_LOG(LogJsonObjSer, Warning, TEXT("Pass2: TArray '%s'[%d] __ObjectId %d missing — inline create"),
+                                                                        *Prop->GetName(), i, SubId);
+                                                        }
                                                 }
 
                                                 // Legacy JSON (no __ObjectId) — create inline
